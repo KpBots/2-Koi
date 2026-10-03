@@ -1,172 +1,232 @@
-// Sensor de presencia
-const int sensorPresence = A0;
+#include <Arduino.h>
 
-// Sensores Infrarrojos
-const int sensorLeft = 7;
-const int sensorRight = 8;
+// Sensor de presencia y sensores de borde (activos en LOW).
+const uint8_t sensorPresence = A0;
+const uint8_t sensorLeft = 7;
+const uint8_t sensorRight = 8;
 
-// Selectores de estrategia
-const int switchRight = 6;
-const int switchCommon = 5;
-const int switchFront = 4;
-const int switchLeft = 2;
+// IRStart: la placa recibe alimentacion de A1/A2 y entrega OUT en A3.
+const uint8_t irVcc = A1;
+const uint8_t irGnd = A2;
+const uint8_t irOut = A3;
 
-// Motor A - Izquierdo
-const int motorLeftA1B = 9;
-const int motorLeftA1A = 10;
+// Selectores de estrategia (activos en LOW).
+const uint8_t switchRight = 6;
+const uint8_t switchCommon = 5;
+const uint8_t switchFront = 4;
+const uint8_t switchLeft = 2;
 
-// Motor B - Derecho
-const int motorRightB1B = 3;
-const int motorRightB1A = 11;
+// Entradas del puente H: motor izquierdo y motor derecho.
+const uint8_t motorLeftA1B = 9;
+const uint8_t motorLeftA1A = 10;
+const uint8_t motorRightB1B = 3;
+const uint8_t motorRightB1A = 11;
 
-// Temporizadores
-unsigned long previousMillis = 0UL;
-unsigned long interval = 100UL; // Intervalo inicial de 0.1 segundo
-int randomDirection = 0;
+const unsigned long presenceSampleMs = 26UL;
+const unsigned long goBackMs = 100UL;
+const unsigned long turnLeftMs = 150UL;
+const unsigned long turnRightMs = 120UL;
 
-unsigned long actionTimer = 0UL;
+enum MotionState : uint8_t {
+  WAIT_FOR_START,
+  OPENING,
+  EDGE_BACK,
+  EDGE_TURN,
+  SEARCH
+};
 
-unsigned long timerGoBack = 100UL;
-unsigned long timerRotate180Left = 150UL;
-unsigned long timerRotate180Right = 120UL;
+MotionState motionState = WAIT_FOR_START;
+unsigned long stateStartedAt = 0UL;
+unsigned long stateDurationMs = 0UL;
+unsigned long lastPresenceSampleAt = 0UL;
+unsigned long wanderStartedAt = 0UL;
+unsigned long wanderDurationMs = 0UL;
+bool startArmed = false;
+bool presenceSampleValid = false;
+bool opponentPresent = false;
+bool wandering = false;
+bool leftEdgeAtStart = false;
+bool rightEdgeAtStart = false;
 
-////////////////////////////////////////////////
+float distance(int raw);
+void enterSearch();
+void beginOpening(unsigned long now);
+void beginEdgeRecovery(unsigned long now, bool leftEdge, bool rightEdge);
+void updateEdgeRecovery(unsigned long now);
+void updateSearch(unsigned long now);
 
 void setup() {
-  // Sensores
-  pinMode(sensorPresence, INPUT);
-  pinMode(sensorLeft, INPUT);
-  pinMode(sensorRight, INPUT);
-
-  // Selectores de estrategia
-  pinMode(switchRight, INPUT_PULLUP);
-  pinMode(switchCommon, OUTPUT);
-  pinMode(switchFront, INPUT_PULLUP);
-  pinMode(switchLeft, INPUT_PULLUP);
-
-  digitalWrite(switchCommon, LOW);
-
-  // Motores
+  // Primero aseguramos que los motores esten parados.
   pinMode(motorLeftA1B, OUTPUT);
   pinMode(motorLeftA1A, OUTPUT);
   pinMode(motorRightB1B, OUTPUT);
   pinMode(motorRightB1A, OUTPUT);
-
   motorsStop();
 
-  // Usamos el LED integrado para la cuenta atrás y notificar la detección de presencia
-  pinMode(13, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
-  // Espera reglamentaria de 5"
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(13, LOW);
-    delay(500);
-    digitalWrite(13, HIGH);
-    delay(500);
-  }
+  pinMode(sensorPresence, INPUT);
+  pinMode(sensorLeft, INPUT);
+  pinMode(sensorRight, INPUT);
 
-  // Los switches para la selección de estrategia utilizan lógica negada
-  if (!digitalRead(switchLeft)) {
-    // Si activamos ambos selectores laterales, vamos hacia atrás
-    if (!digitalRead(switchRight)) {
-      actionTimer = millis() + timerRotate180Left*2;
-      while(millis() <= actionTimer)
-        motorsRotateLeft();
-    } else {
-      actionTimer = millis() + timerRotate180Left;
-      while(millis() <= actionTimer)
-        motorsRotateLeft();
-    }
-  } else if (!digitalRead(switchFront)) {
-    actionTimer = millis() + timerRotate180Left;
-    while(millis() <= actionTimer)
-      motorsMoveForward();
-  } else if (!digitalRead(switchRight)) {
-    actionTimer = millis() + timerRotate180Right;
-    while(millis() <= actionTimer)
-      motorsRotateRight();
-  }
+  pinMode(switchRight, INPUT_PULLUP);
+  pinMode(switchFront, INPUT_PULLUP);
+  pinMode(switchLeft, INPUT_PULLUP);
+  digitalWrite(switchCommon, LOW);
+  pinMode(switchCommon, OUTPUT);
+
+  // Preparamos el nivel antes de poner A1/A2 como salidas para evitar pulsos.
+  digitalWrite(irVcc, HIGH);
+  pinMode(irVcc, OUTPUT);
+  digitalWrite(irGnd, LOW);
+  pinMode(irGnd, OUTPUT);
+  pinMode(irOut, INPUT);
 }
 
 void loop() {
-  float sensorPresenceValue = distance(analogRead(sensorPresence));
-  int sensorLeftValue = digitalRead(sensorLeft);
-  int sensorRightValue = digitalRead(sensorRight);
-  int switchLeftValue = digitalRead(switchLeft);
-  int switchFrontValue = digitalRead(switchFront);
-  int switchRightValue = digitalRead(switchRight);
-  unsigned long currentMillis;
-  // El sensor de presencia necesita 25.2ms para realizar las lecturas
-  delay(26);
+  const unsigned long now = millis();
 
-  // Detectado el borde del tatami
-  if (!sensorLeftValue || !sensorRightValue) {
-
-    // Nos alejamos
-    actionTimer = millis() + timerGoBack;
-      while(millis() <= actionTimer)
-        motorsMoveBackwards();
-
-    // Encaramos el interior
-    if (!sensorRightValue && sensorLeftValue) {
-      actionTimer = millis() + timerRotate180Left;
-      while(millis() <= actionTimer)
-        motorsTurnLeft();
-    } else if (!sensorLeftValue && sensorRightValue) {
-      actionTimer = millis() + timerRotate180Right;
-      while(millis() <= actionTimer)
-        motorsTurnRight();
-    } else {
-      actionTimer = millis() + timerRotate180Left;
-      while(millis() <= actionTimer)
-        motorsRotateLeft();
+  // OUT del IRStart es un nivel mantenido. STOP tiene prioridad absoluta.
+  if (digitalRead(irOut) == LOW) {
+    startArmed = true; // Exigimos haber visto reposo antes del primer START.
+    if (motionState != WAIT_FOR_START) {
+      motorsStop();
+      motionState = WAIT_FOR_START;
     }
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+  if (!startArmed) {
+    // Un Nano que reinicia con OUT ya alto permanece parado hasta un nuevo ciclo.
+    return;
   }
 
-  if (sensorPresenceValue > 20 && sensorPresenceValue <= 200) {
-    motorsMoveForward();
-    digitalWrite(13, HIGH);
-  } else {
-    digitalWrite(13, LOW);
-    // Deambulamos aleatoriamente
-    currentMillis = millis();
-    if (currentMillis - previousMillis >= interval) {
-      previousMillis = currentMillis;
+  if (motionState == WAIT_FOR_START) {
+    beginOpening(now);
+  }
 
-      // Selecciona una dirección aleatoria
-      randomDirection = random(0, 3);
+  // La maniobra inicial se completa antes de atender los sensores de borde.
+  // STOP se comprueba arriba en cada vuelta, tambien durante esta maniobra.
+  if (motionState == OPENING) {
+    if (now - stateStartedAt < stateDurationMs) return;
+    enterSearch();
+  }
 
-      // Genera un nuevo intervalo aleatorio entre 0.1 y 0.5 segundos
-      interval = random(100UL, 300UL);
+  if (motionState == EDGE_BACK || motionState == EDGE_TURN) {
+    updateEdgeRecovery(now);
+    return;
+  }
 
-      // Ejecuta la dirección aleatoria seleccionada
-      switch (randomDirection) {
-        case 0:
-          motorsTurnLeft();
-          break;
-        case 1:
-          motorsTurnRight();
-          break;
-        case 2:
-          motorsRotateLeft();
-          break;
-        case 3:
-          motorsRotateRight();
-          break;
-      }
+  const bool leftEdge = digitalRead(sensorLeft) == LOW;
+  const bool rightEdge = digitalRead(sensorRight) == LOW;
+  if (leftEdge || rightEdge) {
+    beginEdgeRecovery(now, leftEdge, rightEdge);
+    return;
+  }
+
+  updateSearch(now);
+}
+
+void enterSearch() {
+  motionState = SEARCH;
+  presenceSampleValid = false;
+  wandering = false;
+  motorsStop();
+}
+
+void beginOpening(unsigned long now) {
+  stateStartedAt = now;
+  motionState = OPENING;
+  digitalWrite(LED_BUILTIN, LOW);
+
+  if (digitalRead(switchLeft) == LOW) {
+    if (digitalRead(switchRight) == LOW) {
+      // Ambos selectores laterales: salida hacia atras.
+      stateDurationMs = turnLeftMs * 2UL;
+      motorsMoveBackwards();
+    } else {
+      stateDurationMs = turnLeftMs;
+      motorsRotateLeft();
     }
+  } else if (digitalRead(switchFront) == LOW) {
+    stateDurationMs = turnLeftMs;
+    motorsMoveForward();
+  } else if (digitalRead(switchRight) == LOW) {
+    stateDurationMs = turnRightMs;
+    motorsRotateRight();
+  } else {
+    enterSearch();
   }
 }
 
+void beginEdgeRecovery(unsigned long now, bool leftEdge, bool rightEdge) {
+  leftEdgeAtStart = leftEdge;
+  rightEdgeAtStart = rightEdge;
+  stateStartedAt = now;
+  motionState = EDGE_BACK;
+  digitalWrite(LED_BUILTIN, LOW);
+  motorsMoveBackwards();
+}
 
-// Conversion a distancia en mm
-float distance(int raw) {
-  float Vo = (5.0 * raw) / 1024.0;
-  const float a = 48.375;
-  const float b = 0.0675;
-  float dist = 0;
-  if (Vo > b) {
-    dist = a / (Vo - b);
+void updateEdgeRecovery(unsigned long now) {
+  if (motionState == EDGE_BACK) {
+    if (now - stateStartedAt < goBackMs) return;
+
+    if (rightEdgeAtStart && !leftEdgeAtStart) {
+      stateDurationMs = turnLeftMs;
+      motorsTurnLeft();
+    } else if (leftEdgeAtStart && !rightEdgeAtStart) {
+      stateDurationMs = turnRightMs;
+      motorsTurnRight();
+    } else {
+      stateDurationMs = turnLeftMs;
+      motorsRotateLeft();
+    }
+    stateStartedAt = now;
+    motionState = EDGE_TURN;
+    return;
   }
-  return dist;
+
+  if (now - stateStartedAt >= stateDurationMs) {
+    enterSearch();
+  }
+}
+
+void updateSearch(unsigned long now) {
+  // El sensor de presencia entrega una medida nueva cada ~25,2 ms.
+  if (!presenceSampleValid || now - lastPresenceSampleAt >= presenceSampleMs) {
+    const float measuredDistance = distance(analogRead(sensorPresence));
+    opponentPresent = measuredDistance > 20.0f && measuredDistance <= 200.0f;
+    lastPresenceSampleAt = now;
+    presenceSampleValid = true;
+  }
+
+  if (opponentPresent) {
+    motorsMoveForward();
+    digitalWrite(LED_BUILTIN, HIGH);
+    wandering = false;
+    return;
+  }
+
+  digitalWrite(LED_BUILTIN, LOW);
+  if (!wandering || now - wanderStartedAt >= wanderDurationMs) {
+    switch (random(0, 4)) {
+      case 0: motorsTurnLeft(); break;
+      case 1: motorsTurnRight(); break;
+      case 2: motorsRotateLeft(); break;
+      case 3: motorsRotateRight(); break;
+    }
+    wanderStartedAt = now;
+    wanderDurationMs = random(100UL, 300UL);
+    wandering = true;
+  }
+}
+
+// Conversion de la tension del sensor de presencia a distancia en mm.
+float distance(int raw) {
+  const float voltage = (5.0f * raw) / 1024.0f;
+  const float a = 48.375f;
+  const float b = 0.0675f;
+  return voltage > b ? a / (voltage - b) : 0.0f;
 }
